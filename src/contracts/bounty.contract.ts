@@ -1,4 +1,4 @@
-import { TransactionResponse } from '../types/hive.types';
+import { TransactionResponse, KeychainResponse } from '../types/hive.types';
 import { BountyProgram, BountyClaim } from '../types/bounty.types';
 import { sendHiveTokens } from '../utils/hive';
 import { CONTRACT_ACCOUNT } from '../config/hive.config';
@@ -8,6 +8,8 @@ import {
   getPullRequestDetails, 
   isPRLinkedToIssue 
 } from '../utils/github';
+import { client } from '../config/hive.config';
+import { releaseEscrowFunds } from '../services/escrow.service';
 
 export class BountyContract {
   private username: string;
@@ -18,67 +20,110 @@ export class BountyContract {
 
   // Create new bounty
   async createBounty(bountyData: Omit<BountyProgram, 'id' | 'creator' | 'status' | 'created'>): Promise<TransactionResponse> {
-    // Create bounty record
-    const bounty: Omit<BountyProgram, 'id'> = {
-      creator: this.username,
-      status: 'OPEN',
-      created: new Date().toISOString(),
-      ...bountyData
-    };
-
-    // Store bounty data on chain (using custom_json)
-    return new Promise((resolve, reject) => {
-      if (!window.hive_keychain) {
-        reject(new Error('Hive Keychain extension not found'));
-        return;
+    try {
+      // Validate contract account exists
+      const contractAccounts = await client.database.getAccounts([CONTRACT_ACCOUNT]);
+      if (!contractAccounts || contractAccounts.length === 0) {
+        return {
+          success: false,
+          message: `Contract account ${CONTRACT_ACCOUNT} does not exist`
+        };
       }
 
-      // @ts-ignore
-      window.hive_keychain.requestCustomJson(
-        this.username,
-        'dev-bounties', // Custom operation ID for our app
-        'Active',
-        JSON.stringify({
-          type: 'bounty_create',
-          data: bounty
-        }),
-        'Create Development Bounty',
-        (response: any) => {
-          if (response.success) {
-            // First, transfer HIVE to contract account after successful custom_json
-            sendHiveTokens(
-              this.username,
-              CONTRACT_ACCOUNT,
-              bountyData.prizePool.toString(),
-              `bounty-create-${response.result.id}`
-            ).then(fundResult => {
-              if (fundResult.success) {
-                resolve({
-                  success: true,
-                  message: 'Bounty created successfully on blockchain',
-                  txId: response.result.id
-                });
-              } else {
+      // Create bounty record
+      const bounty: Omit<BountyProgram, 'id'> = {
+        creator: this.username,
+        status: 'OPEN',
+        created: new Date().toISOString(),
+        ...bountyData
+      };
+
+      // Validate user has sufficient balance
+      const accounts = await client.database.getAccounts([this.username]);
+      if (!accounts || accounts.length === 0) {
+        return {
+          success: false,
+          message: 'Could not fetch account information'
+        };
+      }
+
+      const account = accounts[0];
+      const userBalance = parseFloat(String(account.balance));
+      const bountyAmount = parseFloat(bountyData.prizePool.toString());
+
+      if (userBalance < bountyAmount) {
+        return {
+          success: false,
+          message: `Insufficient balance. You have ${userBalance} HIVE but the bounty requires ${bountyAmount} HIVE`
+        };
+      }
+
+      return new Promise((resolve) => {
+        if (!window.hive_keychain) {
+          resolve({
+            success: false,
+            message: 'Hive Keychain extension not found'
+          });
+          return;
+        }
+
+        // First create the bounty record
+        window.hive_keychain.requestCustomJson(
+          this.username,
+          'dev-bounties',
+          'Active', // Using Active authority for both operations
+          JSON.stringify({
+            type: 'bounty_create',
+            data: bounty
+          }),
+          'Create Development Bounty',
+          async (response: KeychainResponse) => {
+            if (response.success) {
+              try {
+                // Then transfer the funds
+                const transferResult = await sendHiveTokens(
+                  this.username,
+                  CONTRACT_ACCOUNT,
+                  bountyData.prizePool.toString(),
+                  `bounty-create-${response.result?.id ?? 'unknown'}`
+                );
+
+                if (transferResult.success) {
+                  resolve({
+                    success: true,
+                    message: 'Bounty created and funded successfully',
+                    txId: response.result?.id ?? 'unknown'
+                  });
+                } else {
+                  // If transfer fails, we should notify but not treat it as a complete failure
+                  resolve({
+                    success: false,
+                    message: `Bounty created but funding failed: ${transferResult.message}. Please try funding manually.`,
+                    txId: response.result?.id ?? 'unknown'
+                  });
+                }
+              } catch (error: any) {
                 resolve({
                   success: false,
-                  message: 'Bounty created but funding failed: ' + fundResult.message
+                  message: `Bounty created but funding failed: ${error.message}. Please try funding manually.`,
+                  txId: response.result?.id ?? 'unknown'
                 });
               }
-            }).catch(err => {
+            } else {
               resolve({
                 success: false,
-                message: 'Bounty created but funding failed: ' + err.message
+                message: response.error || 'Failed to create bounty'
               });
-            });
-          } else {
-            resolve({
-              success: false,
-              message: response.error || 'Failed to create bounty'
-            });
+            }
           }
-        }
-      );
-    });
+        );
+      });
+    } catch (error: any) {
+      return {
+        success: false,
+        message: `Failed to create bounty: ${error.message}`
+      };
+    }
   }
 
   // Claim bounty with PR
@@ -184,7 +229,7 @@ export class BountyContract {
               resolve({
                 success: true,
                 message: 'Claim submitted successfully. The bounty creator will review your claim.',
-                txId: response.result.id
+                txId: response.result?.id ?? 'unknown'
               });
             } else {
               resolve({
@@ -209,13 +254,59 @@ export class BountyContract {
     claim: BountyClaim,
     bountyAmount: string
   ): Promise<TransactionResponse> {
-    // Only bounty creator can verify and pay
-    return sendHiveTokens(
-      CONTRACT_ACCOUNT,
-      claim.solver,
-      bountyAmount,
-      `bounty-paid-${bountyId}`
-    );
+    try {
+      // First record approval on blockchain
+      const approvalResult = await new Promise<TransactionResponse>((resolve) => {
+        window.hive_keychain.requestCustomJson(
+          this.username,
+          'dev-bounties',
+          'Active',
+          JSON.stringify({
+            type: 'bounty_approve',
+            data: {
+              bountyId,
+              approver: this.username,
+              solver: claim.solver,
+              amount: bountyAmount,
+              timestamp: new Date().toISOString()
+            }
+          }),
+          'Approve Bounty Solution',
+          (response: KeychainResponse) => {
+            if (response.success) {
+              resolve({
+                success: true,
+                message: 'Solution approval recorded on blockchain',
+                txId: response.result?.id ?? 'unknown'
+              });
+            } else {
+              resolve({
+                success: false,
+                message: response.error || 'Failed to record approval'
+              });
+            }
+          }
+        );
+      });
+
+      if (!approvalResult.success) {
+        return approvalResult;
+      }
+
+      // Then release funds from escrow service
+      return releaseEscrowFunds(
+        claim.solver,
+        bountyAmount,
+        bountyId,
+        this.username,
+        `Bounty payment for ${bountyId}`
+      );
+    } catch (error: any) {
+      return {
+        success: false,
+        message: `Error processing payment: ${error.message}`
+      };
+    }
   }
 
   // Auto-verify and pay bounty (for demo purposes)
@@ -254,7 +345,7 @@ export class BountyContract {
               resolve({
                 success: true,
                 message: 'Bounty payment successful!',
-                txId: response.result.id
+                txId: response.result?.id ?? 'unknown'
               });
             } else {
               resolve({

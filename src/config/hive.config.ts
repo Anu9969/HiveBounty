@@ -15,6 +15,10 @@ export const APP_TAG = import.meta.env.VITE_APP_TAG;
 export const CONTRACT_ACCOUNT = import.meta.env.VITE_CONTRACT_ACCOUNT;
 export const CONTRACT_MEMO_PREFIX = 'bounty-';
 
+// Escrow service configuration
+export const ESCROW_SERVICE_URL = import.meta.env.VITE_ESCROW_SERVICE_URL || 'http://localhost:3000/api';
+export const ESCROW_API_KEY = import.meta.env.VITE_ESCROW_API_KEY || 'your-api-key';
+
 // Transaction Configuration
 export const TRANSACTION_RETRY_ATTEMPTS = 3;
 export const TRANSACTION_EXPIRY = 60000; // 60 seconds
